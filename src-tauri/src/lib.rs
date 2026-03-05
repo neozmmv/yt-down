@@ -9,31 +9,38 @@ struct VideoInfo {
     thumbnail: String,
 }
 
-fn ytdlp_path() -> Result<PathBuf, String> {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let path = base.join("bin").join("yt-dlp.exe");
+fn ytdlp_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Cannot find resource directory: {e}"))?;
+    let path = resource_dir.join("bin").join("yt-dlp.exe");
     if !path.exists() {
         return Err(format!(
-            "yt-dlp not found at {}. Run setup-bins.ps1 first.",
+            "yt-dlp not found at {}. Please reinstall the application.",
             path.display()
         ));
     }
     Ok(path)
 }
 
-fn bin_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin")
+fn bin_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Cannot find resource directory: {e}"))?;
+    Ok(resource_dir.join("bin"))
 }
 
 #[tauri::command]
-fn get_video_info(url: String) -> Result<VideoInfo, String> {
+fn get_video_info(app: tauri::AppHandle, url: String) -> Result<VideoInfo, String> {
     use std::process::Command;
 
     if url.is_empty() {
         return Err("Empty URL".into());
     }
 
-    let ytdlp = ytdlp_path()?;
+    let ytdlp = ytdlp_path(&app)?;
 
     let out = Command::new(&ytdlp)
         .args([
@@ -88,8 +95,8 @@ fn download_video(
         return Err("URL cannot be empty.".into());
     }
 
-    let ytdlp = ytdlp_path()?;
-    let bin_str = bin_dir().to_string_lossy().into_owned();
+    let ytdlp = ytdlp_path(&app)?;
+    let bin_str = bin_dir(&app)?.to_string_lossy().into_owned();
 
     let downloads_dir = app
         .path()

@@ -1,64 +1,172 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
 
-use tauri::Manager;
 use std::path::PathBuf;
+use tauri::Manager;
 
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+#[derive(serde::Serialize)]
+struct VideoInfo {
+    title: String,
+    thumbnail: String,
+}
+
+fn ytdlp_path() -> Result<PathBuf, String> {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = base.join("bin").join("yt-dlp.exe");
+    if !path.exists() {
+        return Err(format!(
+            "yt-dlp not found at {}. Run setup-bins.ps1 first.",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn bin_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin")
 }
 
 #[tauri::command]
-fn saudacao(nome: String) -> String {
-    format!("Olá, {}, isso veio do Rust!", nome)
-}
-
-#[tauri::command]
-fn download_video(url: String) -> Result<String, String> {
-    use std::path::PathBuf;
+fn get_video_info(url: String) -> Result<VideoInfo, String> {
     use std::process::Command;
 
     if url.is_empty() {
         return Err("Empty URL".into());
     }
 
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin = base.join("bin");
-    let ytdlp = bin.join("yt-dlp.exe");
+    let ytdlp = ytdlp_path()?;
 
-    if !ytdlp.exists() {
-        return Err(format!("yt-dlp not found in {}", ytdlp.display()));
-    }
-
-    // saves in downloads folder, which is created if it doesn't exist
-    let out = Command::new(&ytdlp) //args for download
+    let out = Command::new(&ytdlp)
         .args([
             "--no-playlist",
-            "--ffmpeg-location", &bin.to_string_lossy(),
-            "-f", "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/b[ext=mp4]",
-            "--merge-output-format", "mp4",
-            "--postprocessor-args", "ffmpeg:-c:a aac",
-            "-o", "../downloads/%(title)s.%(ext)s",
+            "--dump-json",
+            "--no-warnings",
+            "--socket-timeout", "15",
             &url,
         ])
         .output()
         .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
     if !out.status.success() {
-        return Err(format!("yt-dlp failed.\n\nstderr:\n{stderr}\n\nstdout:\n{stdout}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("Could not fetch video info: {}", stderr.trim()));
     }
 
-    Ok(format!("OK\n\nstderr:\n{stderr}\n\nstdout:\n{stdout}"))
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("Failed to parse video info: {e}"))?;
+
+    let title = json["title"]
+        .as_str()
+        .unwrap_or("Unknown title")
+        .to_string();
+
+    // prefer a mid-res thumbnail to avoid giant images
+    let thumbnail = json["thumbnails"]
+        .as_array()
+        .and_then(|arr| {
+            // pick the last thumbnail with a reasonable width, or just the last one
+            arr.iter()
+                .filter(|t| t["url"].is_string())
+                .max_by_key(|t| t["width"].as_u64().unwrap_or(0))
+                .and_then(|t| t["url"].as_str())
+        })
+        .or_else(|| json["thumbnail"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(VideoInfo { title, thumbnail })
+}
+
+#[tauri::command]
+fn download_video(
+    app: tauri::AppHandle,
+    url: String,
+    quality: String,
+) -> Result<String, String> {
+    use std::process::Command;
+
+    if url.is_empty() {
+        return Err("URL cannot be empty.".into());
+    }
+
+    let ytdlp = ytdlp_path()?;
+    let bin_str = bin_dir().to_string_lossy().into_owned();
+
+    let downloads_dir = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("Cannot find Downloads folder: {e}"))?;
+
+    let output_template = downloads_dir
+        .join("%(title)s.%(ext)s")
+        .to_string_lossy()
+        .into_owned();
+
+    let mut args: Vec<String> = vec![
+        "--no-playlist".into(),
+        "--ffmpeg-location".into(),
+        bin_str,
+    ];
+
+    match quality.as_str() {
+        "audio" => {
+            args.extend([
+                "-x".into(),
+                "--audio-format".into(),
+                "mp3".into(),
+                "-o".into(),
+                output_template,
+                url,
+            ]);
+        }
+        _ => {
+            let height = match quality.as_str() {
+                "480p" => "480",
+                "720p" => "720",
+                "1080p" => "1080",
+                "best" => "9999",
+                _ => "720",
+            };
+            let format = if height == "9999" {
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]".to_string()
+            } else {
+                format!(
+                    "bestvideo[height<={}][ext=mp4]+bestaudio[ext=m4a]/best[height<={}][ext=mp4]/best[ext=mp4]",
+                    height, height
+                )
+            };
+            args.extend([
+                "-f".into(),
+                format,
+                "--merge-output-format".into(),
+                "mp4".into(),
+                "--postprocessor-args".into(),
+                "ffmpeg:-c:a aac".into(),
+                "-o".into(),
+                output_template,
+                url,
+            ]);
+        }
+    }
+
+    let out = Command::new(&ytdlp)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(format!("{}\n{}", stderr.trim(), stdout.trim()));
+    }
+
+    Ok("Download complete!".into())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, saudacao, download_video])
+        .invoke_handler(tauri::generate_handler![get_video_info, download_video])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
